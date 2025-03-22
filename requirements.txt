@@ -1,0 +1,13 @@
+libpysal==4.12.1
+matplotlib==3.10.1
+networkx==3.4.2
+numpy==2.2.4
+pyevtk==1.6.0
+pynndescent==0.5.13
+scikit_learn==1.6.1
+scipy==1.15.2
+sympy==1.13.1
+torch==2.6.0
+torchmetrics==1.6.3
+torchvision==0.21.0
+tqdm==4.67.1
