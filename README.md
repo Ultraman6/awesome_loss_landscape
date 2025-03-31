@@ -158,6 +158,6 @@ A TensorFlow version, `loss-landscapes-tf`, is planned for the future.
 The package is available on PyPI. Install using `pip install loss-landscapes`. To use the library, import as follows:
 
 ````python
-import loss_landscapes
-import loss_landscapes.metrics
+import landscape
+import landscape.metrics
 ````
