@@ -1,16 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="WUST-LJF" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="WUST_LJF" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="WUST-LJF">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/mnt/d/github/awesome_loss_landscape" local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="XYZ">
+      <paths name="WUST_LJF">
         <serverdata>
           <mappings>
             <mapping deploy="/mnt/d/github/awesome_loss_landscape" local="$PROJECT_DIR$" />

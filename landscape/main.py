@@ -24,6 +24,9 @@ from landscape.options import args, reduce_save_folder
 def get_fix(**kwargs):
     return '_'.join(f'{k}={v}' for k, v in kwargs.items())
 
+def grid():
+
+
 def normalize_direction(start_point, dir, normalization):
     """方向归一化处理"""
     if normalization == 'model':
@@ -135,6 +138,16 @@ class Reducer:
             pbar = tqdm(total=len(all_points), desc="Processing points")
             self.metric.to(self.device)
             if self.args.grid_threads > 1:
+                mp.set_start_method('spawn', force=True)
+                with mp.Pool(processes=20) as pool:
+                    results = [pool.apply_async(self._cal_point, args=(self.model, metric, X.to(self.device).unsqueeze(0),
+                                                                   Y.to(self.device).unsqueeze(0))) for p in all_points]
+                    for result in tqdm(results, desc=f"Proto Eigen Epoch: {self.epoch}"):
+                        Y, preds, protos = result.get()
+                        features.extend([p for p in protos])
+                        labels.extend([y for y in Y])
+                        outputs.extend([p if soft else np.argmax(p) for p in preds])
+
                 with ThreadPoolExecutor(max_workers=self.args.grid_threads) as executor:
                     futures = {tuple(p): executor.submit(self._cal_point,p)
                                for p in all_points}

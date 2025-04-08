@@ -1,10 +1,22 @@
-import argparse
+import numpy as np
 import torch
 import torchmetrics
+from torch.autograd.functional import hessian as Hessian
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 import os, sys
 root = os.path.dirname(os.getcwd())
 sys.path.append(root)
+
+def append_reduce_fx(tensor_list):
+    """
+    自定义归约函数，将不同进程的张量列表合并成一个大列表
+    """
+    gathered = gather_all_tensors(tensor_list)
+    combined_list = []
+    for sub_list in gathered:
+        combined_list.extend(sub_list)
+    return combined_list
 
 @torch.amp.autocast(device_type='cuda')
 def hessian_metric(loss, parameters, desc: str='computing hessian by row', top: int = 1):
@@ -278,97 +290,11 @@ class HessianMetric(torchmetrics.Metric):
     def compute(self):
         pass
 
-# class ProtoHessianMetric(torchmetrics.Metric):
-#     def __init__(self, criterion, dim, num_classes, top=1, multi_cls=False, dist_sync_on_step=True):
-#         """
-#         :param num_classes: 类别数量
-#         :param criterion: 外部传入的损失函数
-#         :param dim: 隐藏特征的展平维度
-#         :param multi_cls: 是否进行多类别计算，默认 False
-#         :param dist_sync_on_step: 是否在每个步骤同步分布式数据，默认 True
-#         """
-#         super().__init__(dist_sync_on_step=dist_sync_on_step)
-#         self.num_classes = num_classes
-#         self.criterion = criterion
-#         self.multi_cls = multi_cls
-#         self.top = top
-#         self.add_state("loss_sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
-#         self.add_state("proto_sum", default=torch.zeros(dim), dist_reduce_fx="sum")
-#         self.add_state("sample_num", default=torch.tensor(0), dist_reduce_fx="sum")
-#         if multi_cls:
-#             self.add_state("loss_sum_per_cls", default=torch.zeros(num_classes, dim), dist_reduce_fx="sum")
-#             self.add_state("sample_num_per_cls", default=torch.zeros(num_classes), dist_reduce_fx="sum")
-#             self.add_state("proto_sum_per_cls", default=torch.tensor(0.0), dist_reduce_fx="sum")
-#
-#     @torch.enable_grad()
-#     def update(self, preds, targets, protos):
-#         """
-#         更新损失的相关信息
-#         :param preds: 模型预测值
-#         :param targets: 真实标签
-#         :param protos: 隐藏特征
-#         """
-#         batch_losses = self.criterion(preds, targets, reduction='none')
-#         self.loss_sum += batch_losses.sum()
-#         self.sample_num += len(targets)
-#         if self.multi_cls:
-#             for batch_loss, cls_idx, proto in zip(batch_losses, targets, protos):
-#                 cls_idx = int(cls_idx.item())
-#                 self.loss_sum_per_cls[cls_idx] += batch_loss
-#                 self.proto_sum_per_cls[cls_idx] += proto.detech()
-#                 self.sample_num_per_cls[cls_idx] += 1
-#
-#     @torch.enable_grad()
-#     def _compute(self):
-#         """
-#         计算并返回 Hessian 矩阵的奇异值和向量
-#         :return: 奇异值和向量
-#         """
-#         if self.multi_cls:
-#             return self._compute_by_cls()
-#         else:
-#             return self._compute_all()
-#
-#     def _compute_all(self):
-#         avg_loss = self.loss_sum / self.sample_num
-#         avg_proto = self.proto_sum / self.sample_num
-#         return hessian_metric(avg_loss, avg_proto, top=self.top)
-#
-#     def _compute_by_cls(self):
-#         eigen_values_per_cls = {}
-#         eigen_vectors_per_cls = {}
-#         hessian_trace_per_cls = {}
-#         hessian_density_per_cls = {}
-#         for cls_idx in range(self.num_classes):
-#             if self.sample_num_per_cls[cls_idx] > 0:
-#                 avg_loss = self.loss_sum_per_cls[cls_idx] / self.sample_num_per_cls[cls_idx]
-#                 avg_proto = self.proto_sum_per_cls[cls_idx] / self.sample_num_per_cls[cls_idx]
-#                 (eigen_values_per_cls[cls_idx], eigen_vectors_per_cls[cls_idx],
-#                  hessian_trace_per_cls[cls_idx], hessian_density_per_cls[cls_idx]) \
-#                     = hessian_metric(avg_loss, avg_proto, top=self.top,
-#                                desc=f'computing hessian for class{cls_idx} by row')
-#         return eigen_values_per_cls, eigen_vectors_per_cls, hessian_trace_per_cls, hessian_density_per_cls
-#
-#     def reset(self):
-#         """
-#         重置相关状态
-#         """
-#         self.loss_sum.zero_()
-#         self.sample_num.zero_()
-#         if self.multi_cls:
-#             self.loss_sum_per_cls.zero_()
-#             self.sample_num_per_cls.zero_()
-#
-#     def __call__(self, preds, targets):
-#         self.update(preds, targets)
-#
-#     def compute(self):
-#         pass
-
-class ProtoHessianMetric(torchmetrics.Metric):
-    def __init__(self, criterion, dim, num_classes, top=0, multi_cls=False, dist_sync_on_step=True):
+# 计算特征原型的主成分方向，可设置0-2阶 item: 原型向量、梯度向量、奇异向量
+class ProtoPCAMetric(torchmetrics.Metric):
+    def __init__(self, criterion, num_classes, top=3, order=0, multi_cls=False, dist_sync_on_step=True):
         """
-        初始化 HessianMetric 类
+        初始化 ProtoMetric 类
         :param num_classes: 类别数量
         :param criterion: 外部传入的损失函数
         :param multi_cls: 是否进行多类别计算，默认 False
@@ -379,80 +305,68 @@ class ProtoHessianMetric(torchmetrics.Metric):
         self.criterion = criterion
         self.multi_cls = multi_cls
         self.top = top
-        self.add_state("hessian_sum", default=torch.zeros(dim, dim), dist_reduce_fx="sum")
-        self.add_state("sample_num", default=torch.tensor(0), dist_reduce_fx="sum")
-        # if multi_cls:
-        #     self.add_state("hessian_sum_per_cls", default=torch.zeros(num_classes, dim, dim),
-        #                    dist_reduce_fx="sum")
-        #     self.add_state("sample_num_per_cls", default=torch.zeros(num_classes), dist_reduce_fx="sum")
+        self.order = order
+        self.add_state("item_list", default=[], dist_reduce_fx=append_reduce_fx)
+        if multi_cls:
+            self.add_state("item_list_per_cls", default=[[] for _ in range(num_classes)],
+                           dist_reduce_fx=append_reduce_fx)
 
     @torch.enable_grad()
-    def update(self, preds, targets, protos):
+    def update(self, head, targets, protos):
         """
         更新 Hessian 矩阵的相关信息
         :param preds: 模型预测值
         :param targets: 真实标签
         """
         # 对每个样本计算损失，此时不需要 reduction='none'
-        sample_loss = self.criterion(preds, targets)
-        # 设置 allow_unused=True
-        grads = torch.autograd.grad(sample_loss, protos, create_graph=True, allow_unused=True)
-        hessian = []
-        for g in torch.cat([g.flatten() for g in grads if g is not None]):
-            # 设置 allow_unused=True
-            hessian_row = torch.autograd.grad(g, protos, retain_graph=True, allow_unused=True)
-            hessian_row = torch.cat([h.flatten() for h in hessian_row if h is not None])
-            hessian.append(hessian_row)
-        hessian = torch.stack(hessian).detach()
-        self.hessian_sum += hessian
-        self.sample_num += 1
-        # if self.multi_cls:
-        #     cls_idx = int(targets.item())
-        #     self.hessian_sum_per_cls[cls_idx] += hessian
-        #     self.sample_num_per_cls[cls_idx] += 1
+        if self.order == 0:
+            results = [p.detach().cpu().numpy() for p in protos]
+        else:
+            if self.order == 1:
+                loss = self.criterion(head(protos), targets)
+                grads = torch.autograd.grad(loss, protos, allow_unused=True)
+                results = [g.detach().cpu().numpy() for g in grads]
+            elif self.order == 2:
+                results = []
+                hessian = (Hessian(lambda protos: self.criterion(head(protos), targets), protos))
+                for idx in range(targets.shape[0]):
+                    U, _, _ = torch.linalg.svd(hessian[idx, :, idx, :])
+                    results.append(U[0, :].detach().cpu().numpy())
+            else:
+                raise ValueError(f"Invalid order value: {self.order}. Order should be 0, 1, or 2.")
+
+        self.item_list.extend(results)
+        if self.multi_cls:
+            for r, y in zip(results, targets):
+                self.item_list_per_cls[y].append(r)
 
     def _compute(self, multi_cls:bool=False):
         """
         计算并返回 Hessian 矩阵的奇异值和向量
         :return: 奇异值和向量
         """
-        # if self.multi_cls and multi_cls:
-        #     mask = self.sample_num_per_class > 0
-        #     hessian_per_class = self.hessian_per_class.clone()
-        #     hessian_per_class[mask] /= self.sample_num_per_class[mask].unsqueeze(1).unsqueeze(2)
-        #     U, S, _ = torch.linalg.svd(hessian_per_class[mask])
-        #     if self.top == -1:
-        #         top_indices = [torch.arange(S.shape[1]) for _ in range(S.shape[0])]
-        #     else:
-        #         top_indices = torch.argsort(S, dim=1, descending=True)[:, :self.top]
-        #     eigen_values_per_cls = {cls_idx: S[i, top_indices[i]] for i, cls_idx in
-        #                             enumerate(torch.where(mask)[0])}
-        #     eigen_vectors_per_cls = {cls_idx: U[i, :, top_indices[i]] for i, cls_idx in
-        #                              enumerate(torch.where(mask)[0])}
-        #     # 计算 Hessian 矩阵的迹
-        #     return eigen_values_per_cls, eigen_vectors_per_cls
-        # else:
-        hessian = self.hessian / self.sample_num
-        U, S, _ = torch.linalg.svd(hessian)
-        if self.top == -1:
-            top_indices = [torch.arange(S.shape[1]) for _ in range(S.shape[0])]
+        if self.multi_cls and multi_cls:
+            results = {}
+            for cls in range(self.num_classes):
+                array = self.item_list_per_cls[cls]
+                if array:
+                    pca = PCA(n_components=2)
+                    pca.fit(np.array(array))
+                    results[cls] = (pca.components_, pca.explained_variance_.tolist())
+                else:
+                    results[cls] = None
         else:
-            top_indices = torch.argsort(S, dim=1, descending=True)[:, :self.top]
-        eigen_values = S[top_indices]
-        eigen_vectors = U[:, top_indices]
-        hessian_trace = torch.trace(hessian)
-        hessian_density = torch.count_nonzero(hessian).item() / (hessian.numel())
-        return eigen_values, eigen_vectors, hessian_trace, hessian_density
+            pca = PCA(n_components=self.top)
+            pca.fit(np.array(self.item_list))
+            return pca.components_, pca.explained_variance_.tolist()
 
     def reset(self):
         """
         重置相关状态
         """
-        self.hessian_sum.zero_()
-        self.sample_num.zero_()
-        # if self.multi_cls:
-        #     self.hessian_sum_per_cls.zero_()
-        #     self.sample_num_per_cls.zero_()
+        self.item_list.clear()
+        if self.multi_cls:
+            self.item_list_by_cls.clear()
 
     def __call__(self, preds, targets, model_params):
         self.update(preds, targets, model_params)
@@ -461,129 +375,5 @@ class ProtoHessianMetric(torchmetrics.Metric):
         pass
 
 if __name__ == '__main__':
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    import matplotlib.pyplot as plt
-
-    # 检查 CUDA 是否可用
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 更复杂的模型
-    class ComplexModel(nn.Module):
-        def __init__(self):
-            super(ComplexModel, self).__init__()
-            self.conv1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
-            self.pool = nn.MaxPool1d(kernel_size=2)
-            self.linear1 = nn.Linear(16 * 50, 64)
-            self.linear2 = nn.Linear(64, 1)
-
-        def forward(self, x):
-            x = x.unsqueeze(1)  # 添加通道维度以适应卷积层输入
-            x = self.conv1(x)
-            x = torch.relu(x)
-            x = self.pool(x)
-            x = x.view(-1, 16 * 50)
-            x = self.linear1(x)
-            x = torch.relu(x)
-            x = self.linear2(x)
-            return x
-
-    # 生成假数据，调整输入数据长度为 100
-    x = torch.randn(100, 100).to(device)
-    y = 2 * x.mean(dim=1, keepdim=True) + 1 + 0.1 * torch.randn(100, 1).to(device)
-
-    # 初始化模型、损失函数和优化器
-    model = ComplexModel().to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
-
-    # 方式一：每批更新时计算 Hessian
-    hessian_sum_1 = None
-    sample_num_1 = 0
-    for _ in range(10):
-        outputs = model(x)
-        loss = criterion(outputs, y)
-        optimizer.zero_grad()
-        loss.backward(create_graph=True)
-
-        # 获取模型参数
-        params = list(model.parameters())
-        param_count = sum(p.numel() for p in params)
-        hessian = torch.zeros(param_count, param_count).to(device)
-
-        grads = []
-        for param in params:
-            if param.grad is not None:
-                grads.append(param.grad.flatten())
-        grads = torch.cat(grads)
-
-        for i in tqdm(range(len(grads))):
-            hessian_row = torch.autograd.grad(grads[i], params, retain_graph=True)
-            hessian_row = torch.cat([h.flatten() for h in hessian_row])
-            hessian[i] = hessian_row
-
-        if hessian_sum_1 is None:
-            hessian_sum_1 = hessian
-        else:
-            hessian_sum_1 += hessian
-        sample_num_1 += 1
-
-    average_hessian_1 = hessian_sum_1 / sample_num_1
-
-    # 方式二：先累加损失，最后计算 Hessian
-    total_loss = 0
-    sample_num_2 = 0
-    for _ in range(10):
-        outputs = model(x)
-        loss = criterion(outputs, y)
-        total_loss += loss
-        sample_num_2 += 1
-
-    avg_loss = total_loss / sample_num_2
-    optimizer.zero_grad()
-    avg_loss.backward(create_graph=True)
-    average_hessian_1 = average_hessian_1.to('cpu')
-
-    params = list(model.parameters())
-    param_count = sum(p.numel() for p in params)
-    hessian_2 = torch.zeros(param_count, param_count).to(device)
-
-    grads = []
-    for param in params:
-        if param.grad is not None:
-            grads.append(param.grad.flatten())
-        grads = torch.cat(grads)
-
-        for i in tqdm(range(len(grads))):
-            hessian_row = torch.autograd.grad(grads[i], params, retain_graph=True)
-            hessian_row = torch.cat([h.flatten() for h in hessian_row])
-            hessian_2[i] = hessian_row
-
-    hessian_2 = hessian_2.to('cpu')
-    # 比较两种方式计算的 Hessian
-    equivalent = torch.allclose(average_hessian_1, hessian_2, atol=1e-5)
-    if equivalent:
-        print("两种计算方式得到的 Hessian 矩阵近似相等。")
-    else:
-        print("两种计算方式得到的 Hessian 矩阵差异较大。")
-
-    # 可视化部分
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-
-    # 绘制方式一计算的 Hessian 矩阵
-    axes[0].imshow(average_hessian_1.cpu().detach().numpy(), cmap='viridis')
-    axes[0].set_title('Hessian computed by Method 1')
-    axes[0].axis('off')
-
-    # 绘制方式二计算的 Hessian 矩阵
-    axes[1].imshow(hessian_2.cpu().detach().numpy(), cmap='viridis')
-    axes[1].set_title('Hessian computed by Method 2')
-    axes[1].axis('off')
-
-    plt.tight_layout()
-    plt.show()
-
-    print(average_hessian_1)
-    print(hessian_2)
+    pass
 

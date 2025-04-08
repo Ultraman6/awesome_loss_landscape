@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="awesome_loss_landscape" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="loss-lens" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="easyFL" project-jdk-type="Python SDK" />
 </project>

@@ -13,3 +13,8 @@ pandas
 openpyxl
 pyevtk
 libpysal
+torch
+torchvision
+torchaudio
+umap
+graphlearning

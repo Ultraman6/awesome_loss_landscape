@@ -1,6 +1,6 @@
 import os
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
 from benchmark.model import vgg
@@ -70,46 +70,50 @@ class DataModule:
         self.train_set = CIFAR10(root=self.data_path, train=True, download=True, transform=train_transform)
         self.eval_set = CIFAR10(root=self.data_path, train=False, download=True, transform=test_transform)
 
-    # @property
-    # def eval_set(self):
-    #     if not hasattr(self, 'eval_set'):
-    #         self._eval_set = CIFAR10(root=self.data_path, train=False, download=True, transform=test_transform)
-    #     return self._eval_set
-    #
-    # @property
-    # def train_set(self):
-    #     if not hasattr(self, 'train_set'):
-    #         self._train_set = CIFAR10(root=self.data_path, train=True, download=True, transform=train_transform)
-    #     return self._train_set
-
-    @property
-    def train_loader(self):
+    def train_loader(self, cls_list=None):
         """Return the train dataloader for PyTorch Lightning.
 
         Args:
             num_workers (optional): Defaults to 0.
         """
+        if cls_list:
+            return DataLoader(
+                TensorDataset(*self.eval_data(cls_list)),
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+                shuffle=True
+            )
         if not hasattr(self, '_train_loader'):
             self._train_loader = DataLoader(
                 self.train_set,
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
                 persistent_workers=True,
+                shuffle=True
             )
         return self._train_loader
 
-    @property
-    def eval_loader(self):
+    def eval_loader(self, cls_list=None):
         """Return the train dataloader for PyTorch Lightning.
         Args:
             num_workers (optional): Defaults to 0.
         """
+        if cls_list:
+            return DataLoader(
+                TensorDataset(*self.eval_data(cls_list)),
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+                shuffle=True
+            )
         if not hasattr(self, '_eval_loader'):
             self._eval_loader = DataLoader(
                 self.eval_set,
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
                 persistent_workers=True,
+                shuffle=True
             )
         return self._eval_loader
 

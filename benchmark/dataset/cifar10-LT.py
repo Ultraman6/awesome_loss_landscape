@@ -6,7 +6,7 @@ from benchmark.main import print_distribution
 import torch
 import torchvision
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torchvision import transforms
 from benchmark.model import vgg
 from benchmark.model import cnn, resnet, densenet
@@ -160,23 +160,6 @@ class DataModule:
         self.eval_set = IMBALANCECIFAR10(root=self.data_path, imbalance_ratio=1.0, train=False)
 
     @property
-    def train_loader(self):
-        """Return the train dataloader for PyTorch Lightning.
-
-        Args:
-            num_workers (optional): Defaults to 0.
-        """
-        if not hasattr(self, '_train_loader'):
-            self._train_loader = DataLoader(
-                self.train_set,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                persistent_workers=True,
-                shuffle=True
-            )
-        return self._train_loader
-
-    @property
     def train_vol(self):
         if not hasattr(self, '_train_vol'):
             self._train_vol = len(self.train_set)
@@ -188,12 +171,43 @@ class DataModule:
             self._eval_vol = len(self.eval_set)
         return self._eval_vol
 
-    @property
-    def eval_loader(self):
+    def train_loader(self, cls_list=None):
+        """Return the train dataloader for PyTorch Lightning.
+
+        Args:
+            num_workers (optional): Defaults to 0.
+        """
+        if cls_list:
+            return DataLoader(
+                TensorDataset(*self.eval_data(cls_list)),
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+                shuffle=True
+            )
+        if not hasattr(self, '_train_loader'):
+            self._train_loader = DataLoader(
+                self.train_set,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+                shuffle=True
+            )
+        return self._train_loader
+
+    def eval_loader(self, cls_list=None):
         """Return the train dataloader for PyTorch Lightning.
         Args:
             num_workers (optional): Defaults to 0.
         """
+        if cls_list:
+            return DataLoader(
+                TensorDataset(*self.eval_data(cls_list)),
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+                shuffle=True
+            )
         if not hasattr(self, '_eval_loader'):
             self._eval_loader = DataLoader(
                 self.eval_set,

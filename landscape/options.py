@@ -28,7 +28,7 @@ parser.add_argument('--center_epoch', default=-2, type=int, help='-1 means the l
 parser.add_argument('--end_epoch', default=-1, type=int, help='-1 means the last epoch')
 parser.add_argument('--signs', nargs='+', default=('directions', 'grid', 'trajectory'))
 parser.add_argument('--saves', nargs='+', default=('directions', 'grid', 'trajectory'))
-parser.add_argument('--loads', nargs='+', default=())
+parser.add_argument('--loads', nargs='+', default=('directions', ''))
 parser.add_argument('--cls_idxes', default=())
 
 parser.add_argument('--device', default='cuda')

@@ -1,8 +1,10 @@
 import os, sys
+import concurrent.futures
+
+from benchmark.boundary import perturb
+
 root = os.path.dirname(os.getcwd())
 sys.path.append(root)
-from hess_vec_prod import eval_hess_vec_prod, npvec_to_tensorlist
-from benchmark.boundary import plot
 import torch.distributed as dist
 import umap
 from sklearn.decomposition import PCA
@@ -20,10 +22,10 @@ import torch
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
 from tqdm import tqdm
-from benchmark.metrics import LossMetric, AccuracyMetric, ProtoHessianMetric, HessianMetric
+from benchmark.metrics import LossMetric, AccuracyMetric, ProtoPCAMetric
 from options import args
 import numpy as np
-from hessian import Hessian
+import torch.multiprocessing as mp
 
 def visual_prototype(features, labels, outputs=None, dirs=None, method:str = "pca", desc=None, path=None):
     print(f"reducing by {method} with features shape: {features.shape}, "
@@ -37,10 +39,11 @@ def visual_prototype(features, labels, outputs=None, dirs=None, method:str = "pc
     elif method == "umap":
         umap_reducer = umap.UMAP(verbose=True)
         reduce_features = umap_reducer.fit_transform(features)
-    elif method == 'eigen':
-        if not dirs:
+    elif method == 'proj':
+        if dirs is None:
             raise ValueError("dirs must be provided when method is 'eigen'.")
-        reduce_features = np.dot(features, dirs[:, :2])
+        print(dirs.shape)
+        reduce_features = np.dot(features, dirs.T)
     elif method == 'ars':
         reduce_features = gl.graph.ars(features, prog=True)
     else:
@@ -151,6 +154,19 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
+def proto_eigen(model, metric, X, Y):
+    protos = model.encoder(X).detach()
+    metric.update(model.head, Y, protos)
+    preds = model(X).detach()
+    return (Y.cpu().numpy(), protos.detach().cpu().numpy(),
+            F.log_softmax(preds, dim=1).detach().cpu().numpy())
+
+def proto(model, X, Y):
+    protos = model.encoder(X).detach()
+    preds = model(X).detach()
+    return (Y.cpu().numpy(), protos.detach().cpu().numpy(),
+            F.log_softmax(preds, dim=1).detach().cpu().numpy())
+
 class Trainer:
     epoch = 0
     train_losses, train_accuracies = {}, {}
@@ -195,11 +211,6 @@ class Trainer:
         self.optimizer.load_state_dict(store['optimizer_state_dict'])
         self.epoch = store['epoch']
         self.lr = store['lr']
-        self.proto['features'] = getattr(store, 'proto', None)
-        self.proto['labels'] = getattr(store, 'labels', None)
-        self.proto['outputs'] = getattr(store, 'outputs', None)
-        self.proto['dirs'] = getattr(store, 'dirs', None)
-        self.proto['desc'] = getattr(store, 'desc', None)
 
         print(f"Resume from {filepath}, epoch: {self.epoch}, lr: {self.lr}")
 
@@ -261,12 +272,12 @@ class Trainer:
 
     @torch.enable_grad()
     def train_step(self):
-        pbar = tqdm(total=len(self.data.train_loader),
+        pbar = tqdm(total=len(self.data.train_loader()),
                     desc=f"Training Epoch: {self.epoch}")
         self.model.train().to(self.device)
         self.loss_metric.reset()
         self.acc_metric.reset()
-        for (inputs, targets) in self.data.train_loader:
+        for (inputs, targets) in self.data.train_loader():
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             outputs = self.model(inputs)
 
@@ -282,7 +293,7 @@ class Trainer:
 
     @torch.no_grad()
     def eval_step(self, train:bool=False):
-        dataloader = self.data.train_loader if train else self.data.eval_loader
+        dataloader = self.data.train_loader() if train else self.data.eval_loader()
         pbar = tqdm(total=len(dataloader),
                     desc=f"Testing Epoch: {self.epoch} on "
                          f"{'train' if train else 'test'}")
@@ -303,131 +314,89 @@ class Trainer:
         self.log_metrics(pbar, train=train)
 
     @torch.no_grad()
-    def proto_step(self, eval:bool=False, soft:bool=False, save:bool=True):
-        if (not getattr(self.proto, 'features', None) or
-            not getattr(self.proto, 'labels', None) or
-            not getattr(self.proto, 'outputs', None)):
+    def proto_step(self, root:str, eval:bool=False, soft:bool=False, save:bool=True, cls_list:tuple=()):
+        filepath = os.path.join(root,
+                                f"embedding_epoch={self.epoch}_"
+                                f"classes={str(cls_list)}_"
+                                f"{'eval' if eval else 'train'}.ckpt")
+        if os.path.exists(filepath):
+            store = torch.load(filepath, weights_only=False)
+        else:
+            store = {}
 
-            dataloader = self.data.eval_loader if eval else self.data.train_loader
-            pbar = tqdm(total=len(dataloader),
-                        desc=f"Proto Epoch: {self.epoch}")
+        if ('embeddings' in store and 'labels' in store and
+            f"{'soft' if soft else 'hard'}_logits" in store):
+            print(f"load embeddings、labels、logits from {filepath}")
+            return store.values()
+        else:
+            dataloader = self.data.eval_loader(cls_list) if eval else self.data.train_loader(cls_list)
             if not (hasattr(self.model, 'encoder') or hasattr(self.model, 'head')):
                 raise ValueError(f"Encoder or Head not found in {self.model.__class__.__name__}.")
-
             self.model.eval().to(self.device)
             features, labels, outputs = [], [], []
-            for (X, Y) in dataloader:
-                X, Y = X.to(self.device), Y.to(self.device)
-                batch_feature = self.model.encoder(X)
-                preds = self.model.head(batch_feature)
-                preds = F.log_softmax(preds, dim=1)
-                for sample_feature in batch_feature.cpu().numpy():
-                    features.append(sample_feature)
-                for sample_label in Y.cpu().numpy():
-                    labels.append(sample_label)
-                for sample_output in preds.cpu().numpy():
-                    outputs.append(sample_output if soft else np.argmax(sample_output))
-                pbar.update(1)
+            mp.set_start_method('spawn', force=True)
+            with mp.Pool(processes=20) as pool:
+                results = [pool.apply_async(proto, args=(self.model, X.to(self.device),
+                                                         Y.to(self.device))) for X, Y in dataloader]
+                for result in tqdm(results, desc=f"Proto Epoch: {self.epoch}"):
+                    Y, preds, protos = result.get()
+                    features.extend([p for p in protos])
+                    labels.extend([y for y in Y])
+                    outputs.extend([p if soft else np.argmax(p) for p in preds])
+
             features, labels, outputs = np.array(features), np.array(labels), np.array(outputs)
             if save:
-                filepath = self.resume_filepath()
-                if os.path.exists(filepath):
-                    store = torch.load(filepath, weights_only=False)
-                else:
-                    store = {}
-                store['proto'] = np.array(features)
+                store = {'embeddings': features, 'labels': labels,
+                         f"{'soft' if soft else 'hard'}_logits": outputs}
                 torch.save(store, filepath)
-                print(f"features、labels、outputs saved at {filepath}.")
+                print(f"embeddings、labels、logits 、dirs、desc saved at {filepath}.")
+            return features, labels, outputs
+
+    def proto_eigen_step(self, root:str, eval:bool = False, soft:bool = False, top:int=2, order:int=0, save:bool=True, cls_list:tuple=()):
+        filepath = os.path.join(root,
+                                f"embedding_epoch={self.epoch}_"
+                                f"classes={str(cls_list)}_"
+                                f"{'eval' if eval else 'train'}.ckpt")
+        if os.path.exists(filepath):
+            store = torch.load(filepath, weights_only=False)
         else:
-            features, labels, outputs = self.proto.values()
-        return features, labels, outputs
-
-    def hessian_step(self, eval:bool=False):
-        dataloader = self.data.eval_loader if eval else self.data.train_loader
-        pbar = tqdm(total=len(dataloader),
-                    desc=f"Hessian Epoch: {self.epoch}")
-        metric = HessianMetric(self.criterion, self.model.parameters(),
-                               self.args.num_classes)
-        metric.to(self.device)
-        self.model.train().to(self.device)
-        for (X, Y) in dataloader:
-            X, Y = X.to(self.device), Y.to(self.device)
-            preds = self.model(X)
-            metric.update(preds, Y)
-            pbar.update(1)
-        metric._compute()
-
-    def proto_eigen_step(self, eval:bool = False, soft:bool = False, mode:str='real', save:bool=True):
-        if (not getattr(self.proto, 'features', None) or
-            not getattr(self.proto, 'labels', None) or
-            not getattr(self.proto, 'outputs', None) or
-            not getattr(self.proto, 'dirs', None) or
-            not getattr(self.proto, 'desc', None)):
-
-            # dataloader = self.data.eval_data() if eval else self.data.train_data()
-            # data = [(x, y) for x, y in zip(*dataloader)]
-            dataloader = self.data.eval_loader if eval else self.data.train_loader
-            pbar = tqdm(total=len(dataloader),
-                        desc=f"Proto Epoch: {self.epoch}")
+            store = {}
+        if ('embeddings' in store and 'labels' in store and
+            f"{'soft' if soft else 'hard'}_logits" in store and
+            f"top={top}_order={order}_dirs" in store and
+            f"top={top}_order={order}_desc" in store):
+            print(f"load embeddings、labels、logits、dirs、desc from {filepath}")
+            return store.values()
+        else:
+            data = self.data.eval_data(cls_list) if eval else self.data.train_data(cls_list)
+            dataloader = [(x, y) for x, y in zip(*data)]
             if not (hasattr(self.model, 'encoder') or hasattr(self.model, 'head')):
                 raise ValueError(f"Encoder or Head not found in {self.model.__class__.__name__}.")
-            if mode == 'real':
-                metric = ProtoHessianMetric(self.criterion, num_classes=self.args.num_classes, top=2,
-                                            dim=self.model.head[0].in_features)
-                metric.to(self.device)
-                self.model.eval().to(self.device)
-                features, labels, outputs = [], [], []
-                for (X, Y) in dataloader:
-                    X = X.to(self.device)
-                    Y = Y.to(self.device)
-                    batch_feature = self.model.encoder(X)
-                    preds = self.model.head(batch_feature)
-                    metric.update(preds, Y, batch_feature)
-                    preds = F.log_softmax(preds, dim=1)
-                    for sample_feature in batch_feature.detach().cpu().numpy():
-                        features.append(sample_feature)
-                    for sample_label in Y.cpu().numpy():
-                        labels.append(sample_label)
-                    for sample_output in preds.detach().cpu().numpy():
-                        outputs.append(sample_output if soft else np.argmax(sample_output))
-                    pbar.update(1)
-                eigen_vals, eigen_vecs, hessian_trace, hessian_density = metric._compute()
+            metric = ProtoPCAMetric(self.criterion, num_classes=self.args.num_classes, top=top, order=order)
+            metric.to(self.device)
+            self.model.eval().to(self.device)
+            features, labels, outputs = [], [], []
+            mp.set_start_method('spawn', force=True)
+            with mp.Pool(processes=20) as pool:
+                results = [pool.apply_async(proto_eigen, args=(self.model, metric, X.to(self.device).unsqueeze(0),
+                                                               Y.to(self.device).unsqueeze(0))) for X, Y in dataloader]
+                for result in tqdm(results, desc=f"Proto Eigen Epoch: {self.epoch}"):
+                    Y, preds, protos = result.get()
+                    features.extend([p for p in protos])
+                    labels.extend([y for y in Y])
+                    outputs.extend([p if soft else np.argmax(p) for p in preds])
 
-            elif mode == 'hvp':
-                hessian = Hessian(self.model, self.criterion,
-                                  dataloader=dataloader, device=self.device, proto=True)
-                features, labels, outputs = hessian.get_proto()
-                eigen_vals, eigen_vecs = hessian.eigenvalues()
-                hessian_trace = hessian.trace()
-                hessian_density = hessian.density()
-
-            else:
-                raise ValueError(f"Mode {mode} is not supported.")
-            features = np.array(features)
-            labels = np.array(labels)
-            outputs = np.array(outputs)
-            desc = (f'eigenvalue-top1: {eigen_vals[0]}\n'
-                    f'eigenvalue-top2: {eigen_vals[1]}\n'
-                    f'Hessian Trace: {hessian_trace}\n'
-                    f'Hessian Density: {hessian_density}')
+            pca_vecs, pca_vars = metric._compute()
+            features, labels, outputs = np.array(features), np.array(labels), np.array(outputs)
+            desc = f"variance of each dim:{'_'.join(map(str, pca_vars))}"
             if save:
-                filepath = self.resume_filepath()
-                if os.path.exists(filepath):
-                    store = torch.load(filepath, weights_only=False)
-                else:
-                    store = {}
-                store.upate({
-                    'features': features,
-                    'labels': labels,
-                    'outputs': outputs,
-                    'dirs': eigen_vecs,
-                    'desc': desc
-                })
+                store.update({'embeddings': features, 'labels': labels,
+                              f"{'soft' if soft else 'hard'}_logits": outputs,
+                              f"top={top}_order={order}_dirs": pca_vecs,
+                              f"top={top}_order={order}_desc": desc})
                 torch.save(store, filepath)
-                print(f"features、labels、outputs 、dirs、desc saved at {filepath}.")
-        else:
-            features, labels, outputs, eigen_vecs, desc = self.proto.values()
-        return features, labels, outputs, eigen_vecs, desc
+                print(f"embeddings、labels、logits 、dirs、desc saved at {filepath}.")
+            return features, labels, outputs, pca_vecs, pca_vars
 
     def log_metrics(self, pbar:tqdm, train:bool=True):
         losses = self.train_losses if train else self.eval_losses
@@ -592,103 +561,45 @@ class Trainer:
 
         return self._checkpoints
 
+def calculate_hessian(x, y, device, criterion, net):
+    x, y = x.to(device).unsqueeze(0), y.to(device).unsqueeze(0)
+    proto = net.encoder(x).detach()
+    def loss_func(proto):
+        return criterion(net.head(proto), y)
+    hessian = torch.autograd.functional.hessian(loss_func, proto)
+    torch.linalg.svd(hessian[0, :, 0, :])
+
+def calculate_boundary(x, y, device, criterion, net):
+    x, y = x.to(device).unsqueeze(0), y.to(device).unsqueeze(0)
+    f = net.encoder(x).detach().requires_grad_(True)
+    perturb(f, y, device, net.head, criterion)
+    return hessian
+
+
 if __name__ == '__main__':
     runner = Trainer(args)
-    runner.run()
-    path = str(os.path.join(args.save_root, 'embed_manifold', f'{runner.epoch}_train'))
-    # features, labels, outputs = runner.proto_step(eval=False, soft=False)
-    # visual_prototype(features, labels, outputs, method="pca", path=path)
-    # visual_prototype(features, labels, outputs, method="tsne", path=path)
-    # visual_prototype(features, labels, outputs, method="umap", path=path)
+    runner.model.to(runner.device)
+    data = [(x, y) for x, y in zip(*runner.data.eval_data())]
+    # x, y = data[0]
+    # x = x.to(runner.device).unsqueeze(0)
+    # y = y.to(runner.device).unsqueeze(0)
+    # preds = runner.model(x)
+    # runner.criterion(preds, y)
+    # data = [(x, y) for x, y in zip(*runner.data.train_data())]
+    mp.set_start_method('spawn', force=True)
+    net = runner.model.to(runner.device).train()
+    hessian_list = []
+    with mp.Pool(processes=10) as pool:
+        results = [pool.apply_async(calculate_hessian, args=(x, y, runner.device, runner.criterion, net)) for x, y in data]
+        for result in tqdm(results):
+            hessian_shape = result.get()
 
-    # path = str(os.path.join(args.save_root, f'{runner.epoch}_eval'))
-    # features, labels, outputs = runner.proto_step(eval=True, soft=False)
-    # visual_prototype(features, labels, outputs, method="pca", path=path)
-    # visual_prototype(features, labels, outputs, method="tsne", path=path)
-    # visual_prototype(features, labels, outputs, method="umap", path=path)
-
-    # features, labels, outputs, dirs, desc = runner.proto_eigen_step(eval=False, mode='real', soft=False)
-    # visual_prototype(features, labels, outputs, method="eigen", desc=desc, dirs=dirs,
-    #                  path=str(os.path.join(args.save_root, f'{runner.epoch}_train')))
-
-    # features, labels, outputs, dirs, desc = runner.proto_eigen_step(eval=True, mode='real', soft=False)
-    # visual_prototype(features, labels, outputs, method="eigen", desc=desc, dirs=dirs,
-    #                  path=str(os.path.join(args.save_root, f'{runner.epoch}_train')))
-
-    # @torch.amp.autocast(device_type=runner.device, dtype=torch.float16)
-    # def cal_hessian():
-    #     runner.model.train().to(runner.device)
-    #     X, Y = runner.data.eval_data()
-    #     X, Y = X.to(runner.device), Y.to(runner.device)
-    #     outputs = runner.model(X)
-    #     loss = runner.criterion(outputs, Y)
-    #     # 计算一阶导数
-    #     parameters = runner.model.parameters()
-    #     gradient = torch.autograd.grad(loss, parameters, create_graph=True)
-    #     # 将梯度展平并拼接成一维张量
-    #     gradient = torch.cat(tuple([p.view(-1) for p in gradient]))
-    #     numel = gradient.numel()
-    #     # 初始化Hessian矩阵
-    #     hessian = torch.zeros(size=(numel, numel))
-    #     for idx, derivative in enumerate(gradient):
-    #         # 计算二阶导数
-    #         hessian_row = torch.autograd.grad(derivative, parameters, retain_graph=True)
-    #         # 将二阶导数展平并拼接成一维张量
-    #         hessian_row = torch.cat(tuple([p.view(-1) for p in hessian_row]))
-    #         hessian[idx] = hessian_row
-    #
-    #     hessian = hessian.detach().numpy()
-    #     eigsh(hessian, k=1, tol=1e-2)
-    # cal_hessian()
-
-    # results = {}
-    # step = 50
-    # features, labels, outputs = runner.proto_step(eval=False, save=True)
-    # runner.model.eval().to(runner.args.device)
-    # for c in range(runner.args.num_classes):
-    #     features_c = torch.tensor(features[labels == c]).to(runner.args.device)
-    #     pred_c = F.log_softmax(runner.model.head(features_c), dim=1).detach().cpu().numpy()
-    #     for d in range(c+1, runner.args.num_classes):
-    #         results[c, d] = [np.argmax(pred_c[0]), ]
-    #         # 计算两个类别之间的距离
-    #         features_d = torch.tensor(features[labels == d]).to(runner.args.device)
-    #         dir = (features_c - features_d) / step
-    #         for i in range(1, step):
-    #             point = torch.tensor(features_c + i * dir).to(runner.args.device)
-    #             pred = F.log_softmax(runner.model.head(point), dim=1).detach().cpu().numpy()
-    #             results[c, d].append(np.argmax(pred[0]))
-    #         pred_d = F.log_softmax(runner.model.head(features_d), dim=1).detach().cpu().numpy()
-    #         results[c, d].append(np.argmax(pred_d[0]))
-
-    # 绘制一维线性图
-    # for (c, d), predictions in results.items():
-    #     predictions = np.array(predictions)
-    #     steps = np.arange(len(predictions))
-    #
-    #     plt.figure(figsize=(10, 6))
-    #     plt.plot(steps, predictions, marker='o')
-    #
-    #     plt.title(f'Prediction change from class {c} prototype to class {d} prototype')
-    #     plt.xlabel('Interpolation step')
-    #     plt.ylabel('Predicted class')
-    #     plt.grid(True)
-    #     plt.show()
-
-    # plot(runner.model, runner.log_root, runner.data.eval_data(),
-    #      runner.data.train_loader, None, runner.device,
-    #      resolution=500, range_l=.1, range_r=.1)
-
-    # params = [p for p in runner.model.parameters() if len(p.size()) > 1]
-    # N = sum(p.numel() for p in params)
-    # vec = [torch.randn_like(p) for p in params]
-    # eval_hess_vec_prod(vec, params, runner.model, runner.criterion,
-    #                    runner.data.train_loader, device='cuda')
 
     @atexit.register
     def _():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print("已清空 CUDA GPU 显存。")
+            print("已清空 CUDA 显存。")
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
             print("已清空 MPS 显存。")

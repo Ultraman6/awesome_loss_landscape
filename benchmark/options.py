@@ -18,7 +18,7 @@ def train_save_folder(args):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs', default=100)
-parser.add_argument('--resume_epoch', default=0,
+parser.add_argument('--resume_epoch', default=60,
                     help='0 means not resuming -1 means the last, -2 means the best')
 parser.add_argument('--interval_epoch', default=10)
 parser.add_argument('--device', default='cuda')
@@ -38,8 +38,8 @@ parser.add_argument('--pretrained', default=True)
 parser.add_argument('--batch_size', default=64)
 parser.add_argument('--criterion', default='ce', choices=['ce', 'bce', 'mse'])
 parser.add_argument('--optimizer', default='sgd')
-parser.add_argument('--lr', default=0.1)
-parser.add_argument('--lr_decay', default=1.0)
+parser.add_argument('--lr', default=0.01)
+parser.add_argument('--lr_decay', default=0.998)
 parser.add_argument('--weight_decay', default=0.0005)
 parser.add_argument('--momentum', default=0.9)
 
